@@ -37,6 +37,10 @@ final class LoopDataManager {
     unowned let delegate: LoopDataManagerDelegate
 
     private let logger: CategoryLogger
+    
+    var glucoseUpdated: Bool // flag used to decide if integral RC should be updated or not
+    var overallRetrospectiveCorrection: HKQuantity // value used to display overall RC effect to the user
+    var integralRectrospectiveCorrectionIndicator: String // display integral RC status
 
     init(
         delegate: LoopDataManagerDelegate,
@@ -55,6 +59,9 @@ final class LoopDataManager {
         self.lastLoopCompleted = lastLoopCompleted
         self.lastTempBasal = lastTempBasal
         self.settings = settings
+        self.glucoseUpdated = false
+        self.overallRetrospectiveCorrection = HKQuantity(unit: HKUnit.milligramsPerDeciliter(), doubleValue: 0)
+        self.integralRectrospectiveCorrectionIndicator = " "
 
         let healthStore = HKHealthStore()
 
@@ -255,6 +262,7 @@ final class LoopDataManager {
         glucoseStore.addGlucoseValues(values, device: device) { (success, values, error) in
             if success {
                 self.dataAccessQueue.async {
+                    self.glucoseUpdated = true // new glucose received, enable integral RC update
                     self.glucoseMomentumEffect = nil
                     self.lastGlucoseChange = nil
                     self.retrospectiveGlucoseChange = nil
@@ -760,7 +768,7 @@ final class LoopDataManager {
         let proportionalGain: Double
         let carbEffectLimit: Double
         
-        static var effectDuration: Double = 50
+        static var effectDuration: Double = 60
         static var previousDiscrepancy: Double = 0
         static var integralDiscrepancy: Double = 0
         
@@ -778,7 +786,8 @@ final class LoopDataManager {
         func updateRetrospectiveCorrection(discrepancy: Double,
                                            positiveLimit: Double,
                                            negativeLimit: Double,
-                                           carbEffect: Double) -> Double {
+                                           carbEffect: Double,
+                                           glucoseUpdated: Bool) -> Double {
             if (retrospectiveCorrection.previousDiscrepancy * discrepancy < 0 ||
                 (discrepancy > 0 && carbEffect > carbEffectLimit)){
                 // reset integral action when discrepancy reverses polarity or
@@ -787,16 +796,18 @@ final class LoopDataManager {
                 retrospectiveCorrection.previousDiscrepancy = 0.0
                 retrospectiveCorrection.integralDiscrepancy = integralGain * discrepancy
             } else {
-                // update integral action via low-pass filter y[n] = forget * y[n-1] + gain * u[n]
-                retrospectiveCorrection.integralDiscrepancy =
-                    integralForget * retrospectiveCorrection.integralDiscrepancy +
-                    integralGain * discrepancy
-                // impose safety limits on integral retrospective correction
-                retrospectiveCorrection.integralDiscrepancy = min(max(retrospectiveCorrection.integralDiscrepancy, negativeLimit), positiveLimit)
-                retrospectiveCorrection.previousDiscrepancy = discrepancy
-                // extend duration of retrospective correction effect by 10 min, up to a maxium of 180 min
-                retrospectiveCorrection.effectDuration =
+                if (glucoseUpdated) {
+                    // update integral action via low-pass filter y[n] = forget * y[n-1] + gain * u[n]
+                    retrospectiveCorrection.integralDiscrepancy =
+                        integralForget * retrospectiveCorrection.integralDiscrepancy +
+                        integralGain * discrepancy
+                    // impose safety limits on integral retrospective correction
+                    retrospectiveCorrection.integralDiscrepancy = min(max(retrospectiveCorrection.integralDiscrepancy, negativeLimit), positiveLimit)
+                    retrospectiveCorrection.previousDiscrepancy = discrepancy
+                    // extend duration of retrospective correction effect by 10 min, up to a maxium of 180 min
+                    retrospectiveCorrection.effectDuration =
                     min(retrospectiveCorrection.effectDuration + 10, 180)
+                }
             }
             let overallDiscrepancy = proportionalGain * discrepancy + retrospectiveCorrection.integralDiscrepancy
             return(overallDiscrepancy)
@@ -805,7 +816,7 @@ final class LoopDataManager {
             return(retrospectiveCorrection.effectDuration)
         }
         func resetRetrospectiveCorrection() {
-            retrospectiveCorrection.effectDuration = 50.0
+            retrospectiveCorrection.effectDuration = 60.0
             retrospectiveCorrection.previousDiscrepancy = 0.0
             retrospectiveCorrection.integralDiscrepancy = 0.0
             return
@@ -903,11 +914,26 @@ final class LoopDataManager {
             discrepancy: currentDiscrepancy,
             positiveLimit: integralActionPositiveLimit,
             negativeLimit: integralActionNegativeLimit,
-            carbEffect: currentCarbEffect
+            carbEffect: currentCarbEffect,
+            glucoseUpdated: glucoseUpdated
         )
         
         let effectMinutes = RC.updateEffectDuration()
         dynamicEffectDuration = TimeInterval(minutes: effectMinutes)
+       
+        // update effect value for display
+        overallRetrospectiveCorrection = HKQuantity(unit: glucoseUnit, doubleValue: overallRC)
+        // update integral RC status indicator
+        if (overallRC - currentDiscrepancy > 0.5) {
+            integralRectrospectiveCorrectionIndicator = " ⬆️"
+        } else {
+            if (overallRC - currentDiscrepancy < -0.5) {
+                integralRectrospectiveCorrectionIndicator = " ⬇️"
+            } else {
+                integralRectrospectiveCorrectionIndicator = " "
+            }
+        }
+        
         
         // retrospective correction including integral action
         let scaledDiscrepancy = overallRC * 60.0 / effectMinutes // scaled to account for extended effect duration
@@ -941,6 +967,7 @@ final class LoopDataManager {
         NSLog("myLoop Overall retrospective correction: %f", overallRC)
         NSLog("myLoop Correction effect duration [min]: %f", effectMinutes)
         
+        glucoseUpdated = false // prevent further integral RC updates unless glucose has been updated
     }
 
     /// Measure the effects counteracting insulin observed in the CGM glucose.
